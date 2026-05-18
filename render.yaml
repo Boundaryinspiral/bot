@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: ai-telegram-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn telegram_bot:app --bind 0.0.0.0:$PORT --timeout 120
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: RENDER_URL
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.11.0"
